@@ -1,10 +1,119 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import HostNav from '../components/HostNav'
 
 const TIME_OPTIONS = [10, 20, 30, 60]
 const BLANK_OPTION = () => ({ id: `new-${crypto.randomUUID()}`, content: '', is_correct: false, isNew: true })
+
+// --- Nhập câu hỏi hàng loạt từ file CSV (xuất ra từ Excel) ---
+// Cột: Cau hoi, Dap an 1, Dap an 2, Dap an 3, Dap an 4, Dap an dung (1-4), Thoi gian (giay), Diem toi da, Giai thich
+const CSV_TEMPLATE = [
+  ['Cau hoi', 'Dap an 1', 'Dap an 2', 'Dap an 3', 'Dap an 4', 'Dap an dung (1-4)', 'Thoi gian (giay)', 'Diem toi da', 'Giai thich'],
+  ['Thu do cua Viet Nam la gi?', 'Ho Chi Minh', 'Da Nang', 'Ha Noi', 'Hue', '3', '20', '1000', 'Ha Noi la thu do tu nam 1010'],
+  ['7 x 8 bang bao nhieu?', '54', '56', '58', '64', '2', '10', '500', ''],
+]
+
+function csvCell(value) {
+  const v = String(value ?? '')
+  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v
+}
+
+function downloadCsvTemplate() {
+  const csv = '\uFEFF' + CSV_TEMPLATE.map((row) => row.map(csvCell).join(',')).join('\r\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'mau-cau-hoi-quizrace.csv'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// Parser CSV đơn giản, hỗ trợ dấu ngoặc kép bao quanh ô có dấu phẩy/xuống dòng
+function parseCsvText(text) {
+  const rows = []
+  let row = []
+  let field = ''
+  let inQuotes = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++ } else { inQuotes = false }
+      } else {
+        field += c
+      }
+    } else if (c === '"') {
+      inQuotes = true
+    } else if (c === ',') {
+      row.push(field); field = ''
+    } else if (c === '\r') {
+      // bỏ qua
+    } else if (c === '\n') {
+      row.push(field); rows.push(row); row = []; field = ''
+    } else {
+      field += c
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row) }
+  return rows.filter((r) => r.some((f) => f.trim() !== ''))
+}
+
+function nearestTimeOption(value) {
+  if (TIME_OPTIONS.includes(value)) return value
+  return TIME_OPTIONS.reduce((best, t) => (Math.abs(t - value) < Math.abs(best - value) ? t : best), TIME_OPTIONS[0])
+}
+
+function rowsToQuestions(rows, startPosition) {
+  // Bỏ qua dòng đầu nếu là header (cột đầu không phải nội dung câu hỏi thật)
+  const dataRows = rows[0]?.[0]?.trim().toLowerCase().startsWith('cau hoi') || rows[0]?.[0]?.trim().toLowerCase().startsWith('câu hỏi')
+    ? rows.slice(1)
+    : rows
+
+  const built = []
+  const errors = []
+  dataRows.forEach((r, idx) => {
+    const lineNo = idx + 2
+    const content = (r[0] || '').trim()
+    if (!content) { errors.push(`Dòng ${lineNo}: thiếu nội dung câu hỏi, bỏ qua.`); return }
+
+    const rawOptions = [r[1], r[2], r[3], r[4]].map((v) => (v || '').trim())
+    const options = rawOptions
+      .filter((v) => v !== '')
+      .map((v) => ({ id: `new-${crypto.randomUUID()}`, content: v, is_correct: false, isNew: true }))
+
+    if (options.length < 2) { errors.push(`Dòng ${lineNo}: cần ít nhất 2 đáp án, bỏ qua.`); return }
+
+    const correctIdx = parseInt(r[5], 10)
+    if (!correctIdx || correctIdx < 1 || correctIdx > options.length) {
+      errors.push(`Dòng ${lineNo}: cột "Đáp án đúng" không hợp lệ, bỏ qua.`)
+      return
+    }
+    options[correctIdx - 1].is_correct = true
+
+    const timeVal = parseInt(r[6], 10)
+    const time_limit = nearestTimeOption(Number.isFinite(timeVal) ? timeVal : 20)
+    const scoreVal = parseInt(r[7], 10)
+    const max_score = Number.isFinite(scoreVal) && scoreVal > 0 ? scoreVal : 1000
+    const explanation = (r[8] || '').trim()
+
+    built.push({
+      id: `new-${crypto.randomUUID()}`,
+      isNew: true,
+      position: startPosition + built.length,
+      content,
+      image_url: '',
+      time_limit,
+      max_score,
+      explanation,
+      options,
+    })
+  })
+  return { built, errors }
+}
 
 function blankQuestion(position) {
   return {
@@ -29,6 +138,8 @@ export default function QuizEditor() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [importInfo, setImportInfo] = useState('')
+  const fileInputRef = useRef(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -126,9 +237,9 @@ export default function QuizEditor() {
     })
   }
 
-  function validate() {
-    if (questions.length === 0) return 'Cần ít nhất một câu hỏi.'
-    for (const [i, q] of questions.entries()) {
+  function validate(list = questions) {
+    if (list.length === 0) return 'Cần ít nhất một câu hỏi.'
+    for (const [i, q] of list.entries()) {
       if (!q.content.trim()) return `Câu ${i + 1}: chưa có nội dung.`
       if (q.options.length < 2) return `Câu ${i + 1}: cần ít nhất 2 đáp án.`
       if (q.options.some((o) => !o.content.trim())) return `Câu ${i + 1}: có đáp án còn trống.`
@@ -138,7 +249,11 @@ export default function QuizEditor() {
   }
 
   async function saveAll(markReady) {
-    const err = validate()
+    return persistQuestions(questions, markReady)
+  }
+
+  async function persistQuestions(list, markReady) {
+    const err = validate(list)
     if (markReady && err) {
       setError(err)
       return false
@@ -146,7 +261,7 @@ export default function QuizEditor() {
     setError('')
     setSaving(true)
     try {
-      for (const q of questions) {
+      for (const q of list) {
         let questionId = q.id
         const payload = {
           quiz_id: quizId,
@@ -190,6 +305,38 @@ export default function QuizEditor() {
     }
   }
 
+  function handleImportClick() {
+    fileInputRef.current?.click()
+  }
+
+  function handleImportFile(e) {
+    const file = e.target.files?.[0]
+    e.target.value = '' // cho phép chọn lại cùng file lần sau
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = async () => {
+      const text = String(reader.result || '')
+      const rows = parseCsvText(text)
+      const { built, errors } = rowsToQuestions(rows, questions.length)
+      if (built.length === 0) {
+        setImportInfo('')
+        setError(errors.length ? errors.join(' ') : 'Không đọc được câu hỏi nào từ file này.')
+        return
+      }
+      const merged = [...questions, ...built]
+      setQuestions(merged)
+      setActiveId(built[0].id)
+      setError('')
+      const ok = await persistQuestions(merged, false)
+      if (ok) {
+        setImportInfo(
+          `Đã nhập ${built.length} câu hỏi thành công.` + (errors.length ? ` (${errors.length} dòng bị bỏ qua: ${errors.join(' ')})` : '')
+        )
+      }
+    }
+    reader.readAsText(file, 'UTF-8')
+  }
+
   async function handleOrganize() {
     const ok = await saveAll(true)
     if (ok) navigate(`/host/to-chuc/${quizId}`)
@@ -226,6 +373,20 @@ export default function QuizEditor() {
           </div>
         </div>
 
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 20 }}>
+          <button type="button" className="btn btn--ghost btn--sm" onClick={downloadCsvTemplate}>
+            ⬇ Tải file mẫu Excel/CSV
+          </button>
+          <button type="button" className="btn btn--ghost btn--sm" onClick={handleImportClick}>
+            ⬆ Nhập câu hỏi từ CSV
+          </button>
+          <input ref={fileInputRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleImportFile} />
+          <span style={{ fontSize: 12, color: 'var(--paper-dim)' }}>
+            Mở file mẫu bằng Excel, điền câu hỏi, rồi lưu lại dạng "CSV UTF-8 (Comma delimited)" trước khi tải lên.
+          </span>
+        </div>
+
+        {importInfo && <div className="card" style={{ marginBottom: 20, padding: '10px 16px', fontSize: 13 }}>{importInfo}</div>}
         {error && <div className="scrim-error" style={{ marginBottom: 20 }}>{error}</div>}
 
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 280px) 1fr', gap: 22, alignItems: 'start' }}>
