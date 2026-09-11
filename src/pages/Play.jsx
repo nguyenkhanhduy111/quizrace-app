@@ -52,7 +52,6 @@ export default function Play() {
     if (!session) return
     if (session.status === 'question' && loadedQuestionIndex.current !== session.current_question_index) {
       loadedQuestionIndex.current = session.current_question_index
-      setSelectedOptionId(null)
       setSubmitted(false)
       setResult(null)
       setError('')
